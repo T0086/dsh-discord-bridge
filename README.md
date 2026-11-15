@@ -7,15 +7,34 @@
 ## 它怎么工作
 
 ```
-                    ┌──────────────────────────────┐
-Discord ←── REST ──→│ 插件（Host 进程内，10s 轮询） │←──→ sessionController.prompt()
-        ── REST ──→ │                              │       ↕
-                    └──────────────────────────────┘   同一个会话
+                    ┌────────────────────────────────┐
+Discord ←─ REST ────│ 插件（Host 进程内）             │←──→ sessionController.prompt()
+        ←─ Gateway ─│ 推送优先，轮询兜底              │       ↕
+                    └────────────────────────────────┘   同一个会话
 ```
+
+传输层两种模式，自动切换：
+
+| 模式 | 状态 | 延迟 | 开销 |
+|---|---|---|---|
+| **Gateway 推送** | 首选 | <1 秒 | 一条常连 + 41 秒心跳 |
+| REST 轮询 | 网关连不上时兜底 | 0–10 秒 | 10 秒一次 GET |
+
+网关断线、心跳无 ack、op 7 / op 9，都会自己重连（指数退避，最长 30 秒）；能 resume 就带 `session_id` + `seq` 续上，续不上就重新 identify。
 
 入站靠 `ctx.sessionController.prompt({ sessionId, content:[{type:'text'}] })` —— 这是 DSH Web GUI 自己发消息走的那条路，所以投进去的是一条真正的用户消息，会正常把我叫醒。
 
 出站靠工具 `discord_reply`，走同一个频道（或私信）。
+
+## 必须有的一步：MESSAGE_CONTENT
+
+Gateway 要拿到消息正文，必须在开发者页打开特权意图：
+
+https://discord.com/developers/applications/<APP_ID>/bot → **Privileged Gateway Intents** → 勾 **MESSAGE CONTENT INTENT** → Save Changes
+
+不打开会怎样：连接被 4014 Disallowed intent(s) 拒绝。插件会自动降到基础意图重连（能收事件、但正文为空），并在 discord_status 里挂一行警告；之后每 5 分钟自动试一次升回完整意图，你开完开关不用重载插件。
+
+另外两个（PRESENCE / SERVER MEMBERS）不需要，开了反而在 100 个服务器以上会被平台卡住。
 
 ## 首次配置
 
