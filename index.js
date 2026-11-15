@@ -263,6 +263,8 @@ async function poll() {
   let cfg = loadCfg()
   if (!cfg) return
   try { await drainInbox(cfg) } catch (err) { warn('drainInbox error:', String(err?.message || err)) }
+  // 网关就绪就不再打 REST；轮询退成兜底
+  if (gw.status === 'ready') return
   if (!cfg.token) return
   // 只给了 token 就自己找频道，找到后写回配置
   if (!cfg.channelId && cfg.autoDiscover !== false) {
@@ -355,6 +357,239 @@ async function poll() {
   }
 }
 
+// ---------------------------------------------------------------- gateway
+// 推送优先：Gateway WebSocket 连上就用事件推，线上一有消息立刻到；
+// 连不上（或宿主没有 WebSocket）就退回 REST 轮询，保证不断联。
+const BASE_INTENTS = (1 << 0) | (1 << 9) | (1 << 12)
+// GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES
+const FULL_INTENTS = BASE_INTENTS | (1 << 15) // + MESSAGE_CONTENT（特权，要在开发者页手开）
+let gwIntents = FULL_INTENTS
+
+const gw = {
+  ws: null,
+  status: 'idle', // idle | connecting | open | ready | down | no-ws
+  sessionId: '',
+  resumeUrl: '',
+  seq: 0,
+  botId: '',
+  heartbeatTimer: null,
+  acked: true,
+  attempts: 0,
+  closing: false,
+  lastEventAt: 0,
+  connects: 0,
+}
+let gwBatch = []
+let gwBatchTimer = null
+
+const transport = () => (gw.status === 'ready' ? 'gateway' : 'poll')
+
+function gwSend(payload) {
+  try {
+    if (gw.ws && gw.ws.readyState === 1) gw.ws.send(JSON.stringify(payload))
+  } catch (err) { warn('ws send failed:', err?.message) }
+}
+
+async function gatewayUrl(token) {
+  const r = await api('GET', '/gateway/bot', token)
+  return (r && r.url) || 'wss://gateway.discord.gg'
+}
+
+function gwStopTimer() {
+  if (gw.heartbeatTimer) { clearInterval(gw.heartbeatTimer); gw.heartbeatTimer = null }
+}
+
+function gwRestart(hard) {
+  gwStopTimer()
+  gw.closing = true
+  try { if (gw.ws) gw.ws.close() } catch {}
+  gw.ws = null
+  gw.status = 'down'
+  if (hard) { gw.sessionId = ''; gw.seq = 0; gw.resumeUrl = '' }
+  gw.attempts = Math.min(gw.attempts + 1, 6)
+  const delay = Math.min(30000, 1000 * Math.pow(2, gw.attempts))
+  log('gateway reconnect in', delay, 'ms (hard=' + Boolean(hard) + ')')
+  setTimeout(() => { gw.closing = false; void connectGateway() }, delay)
+}
+
+function gwHeartbeat() {
+  if (!gw.ws) return
+  if (!gw.acked) {
+    warn('gateway heartbeat unacked, reconnecting')
+    gwRestart(false)
+    return
+  }
+  gw.acked = false
+  gwSend({ op: 1, d: gw.seq || null })
+}
+
+async function connectGateway() {
+  if (disposed) return
+  const cfg = loadCfg()
+  if (!cfg || !cfg.token) { gw.status = 'idle'; return }
+  if (typeof WebSocket === 'undefined') {
+    gw.status = 'no-ws'
+    warn('no global WebSocket in this runtime; staying on REST polling')
+    return
+  }
+  // 降级之后每 5 分钟试着升回完整意图：你在开发者页打开开关后，不用重载插件也能自愈
+  if (gwIntents !== FULL_INTENTS && gw.downgradedAt && Date.now() - gw.downgradedAt > 300000) {
+    gwIntents = FULL_INTENTS
+    gw.downgradedAt = 0
+    log('retrying full intents (MESSAGE_CONTENT may now be enabled)')
+  }
+  try {
+    const base = gw.resumeUrl || (await gatewayUrl(cfg.token))
+    const sep = base.includes('?') ? '&' : '?'
+    const ws = new WebSocket(base + sep + 'v=10&encoding=json')
+    gw.ws = ws
+    gw.status = 'connecting'
+    gw.connects += 1
+
+    ws.addEventListener('open', () => {
+      if (gw.closing) return
+      gw.status = 'open'
+      log('gateway socket open')
+    })
+
+    ws.addEventListener('message', (ev) => { onGatewayMessage(ev.data, cfg.token) })
+
+    log('gateway dial', base)
+    ws.addEventListener('error', (ev) => { warn('gateway error event:', (ev && (ev.message || ev.error && ev.error.message)) || 'no detail') })
+
+    ws.addEventListener('close', (ev) => {
+      if (gw.closing) { gw.closing = false; return }
+      gw.status = 'down'
+      warn('gateway socket closed code=' + (ev && ev.code) + ' reason=' + (ev && ev.reason ? String(ev.reason).slice(0, 120) : ''))
+      if (ev && ev.code === 4014 && gwIntents !== BASE_INTENTS) {
+        gwIntents = BASE_INTENTS
+        gw.downgradedAt = Date.now()
+        gw.intentNote = 'MESSAGE_CONTENT 未开启：开发者页 -> Bot -> Privileged Gateway Intents'
+        warn('intent downgraded:', gw.intentNote)
+        gw.attempts = 0
+      }
+      gwRestart(false)
+    })
+  } catch (err) {
+    warn('gateway connect failed:', String(err?.message || err))
+    gwRestart(false)
+  }
+}
+
+function onGatewayMessage(raw, token) {
+  let msg = null
+  try { msg = JSON.parse(typeof raw === 'string' ? raw : String(raw)) } catch { return }
+  if (!msg || typeof msg.op !== 'number') return
+  if (typeof msg.s === 'number') gw.seq = msg.s
+
+  switch (msg.op) {
+    case 10: { // hello
+      gw.acked = true
+      const iv = (msg.d && msg.d.heartbeat_interval) || 41250
+      gwStopTimer()
+      gw.heartbeatTimer = setInterval(gwHeartbeat, iv)
+      log('gateway hello, heartbeat', iv, 'ms')
+      if (gw.sessionId && gw.seq) {
+        gwSend({ op: 6, d: { token, session_id: gw.sessionId, seq: gw.seq } })
+        log('gateway resume attempt at seq', gw.seq)
+      } else {
+        gwSend({ op: 2, d: {
+          token,
+          intents: gwIntents,
+          properties: { os: 'windows', browser: 'dsh-discord-bridge', device: 'dsh-discord-bridge' },
+        } })
+        log('gateway identify sent, intents', gwIntents)
+      }
+      break
+    }
+    case 11: gw.acked = true; break
+    case 1: gwHeartbeat(); break
+    case 7: log('gateway asked reconnect'); gwRestart(false); break
+    case 9:
+      warn('gateway invalid session, resumable=' + Boolean(msg.d))
+      if (msg.d) gwRestart(false)
+      else { gw.sessionId = ''; gw.seq = 0; gw.resumeUrl = ''; gwRestart(true) }
+      break
+    case 0: onGatewayDispatch(msg.t, msg.d); break
+    default: break
+  }
+}
+
+function onGatewayDispatch(type, data) {
+  gw.lastEventAt = Date.now()
+  if (type === 'READY') {
+    gw.status = 'ready'
+    gw.sessionId = data.session_id || ''
+    gw.resumeUrl = String(data.resume_gateway_url || '').replace(/\/$/, '')
+    gw.botId = (data.user && data.user.id) || ''
+    gw.attempts = 0
+    lastError = ''
+    if (gwIntents === FULL_INTENTS) gw.intentNote = ''
+    log('gateway ready as', data.user && data.user.username, 'session', gw.sessionId.slice(0, 8))
+    return
+  }
+  if (type === 'RESUMED') {
+    gw.status = 'ready'
+    gw.attempts = 0
+    log('gateway resumed')
+    return
+  }
+  if (type === 'MESSAGE_CREATE') { onGatewayMessageCreate(data); return }
+}
+
+function onGatewayMessageCreate(m) {
+  if (!m || !m.author) return
+  if (m.author.bot) return
+  if (gw.botId && m.author.id === gw.botId) return
+  const cfg = loadCfg()
+  if (!cfg) return
+  const isDm = Boolean(cfg.dmChannelId) && m.channel_id === cfg.dmChannelId
+  const isCh = Boolean(cfg.channelId) && m.channel_id === cfg.channelId
+  if (!isDm && !isCh) return
+  const allow = Array.isArray(cfg.allowedUserIds) ? cfg.allowedUserIds : []
+  if (allow.length && !allow.includes(m.author.id)) return
+  if (seen.has(m.id)) return
+
+  // 顺手认人，之后回复可以走私信
+  if (!cfg.dmUserId && m.author.id) {
+    persistKey('dmUserId', m.author.id)
+    log('learned dmUserId:', m.author.id)
+  }
+  const body = flatten(m)
+  if (!body) {
+    // 收到事件但正文为空：九成是 MESSAGE_CONTENT 没开，别静默吞掉
+    warn('gateway message with empty content (MESSAGE_CONTENT off?) id=' + m.id)
+    return
+  }
+  seen.add(m.id)
+  gwBatch.push({
+    at: hhmm(m.timestamp),
+    name: (m.author.global_name || m.author.username) || 'someone',
+    text: body,
+  })
+  saveState()
+  if (!gwBatchTimer) {
+    gwBatchTimer = setTimeout(() => { void flushGatewayBatch(isDm ? 'dm' : 'channel') }, 1200)
+  }
+}
+
+async function flushGatewayBatch(kind) {
+  gwBatchTimer = null
+  const items = gwBatch
+  gwBatch = []
+  if (items.length === 0) return
+  const body = composeInbound(items, kind === 'dm' ? '私信' : '频道')
+  if (!body) return
+  try {
+    await deliver(body)
+    lastError = ''
+    log('gateway inbound:', items.length, 'msg ->', body.slice(0, 50))
+  } catch (err) {
+    lastError = String(err?.message || err)
+    warn('gateway deliver failed:', lastError)
+  }
+}
+
 async function loop() {
   // 配置还没写、或者刚改过，都靠每轮重读来感知
   while (!disposed) {
@@ -421,6 +656,8 @@ export function apply(ctx) {
             inboxFile: { type: 'string' },
             sessionId: { type: 'string' },
             lastId: { type: 'string' },
+            transport: { type: 'string' },
+            gateway: { type: 'string' },
             lastPollAt: { type: 'string' },
             lastError: { type: 'string' },
             seen: { type: 'number' },
@@ -430,6 +667,7 @@ export function apply(ctx) {
           const v = value || {}
           const lines = [
             (v.configured ? '✓ 已配置' : '✗ 未配置'),
+            '传输 ' + (v.transport === 'gateway' ? 'Gateway 推送' : 'REST 轮询') + (v.gateway ? ' · ' + v.gateway : ''),
             '通道 ' + (v.channelId || '-') + (v.targetKind ? '（' + (v.targetKind === 'dm' ? '私信' : '频道') + '）' : ''),
             '对方 user id ' + (v.dmUserId || '还没认出来'),
             '会话 ' + v.sessionId,
@@ -450,6 +688,8 @@ export function apply(ctx) {
           inboxFile: cfg && cfg.inboxFile ? cfg.inboxFile : '',
           sessionId: CFG.targetSessionId,
           lastId,
+          transport: transport(),
+          gateway: gw.status + (gw.sessionId ? ' · session ' + gw.sessionId.slice(0, 8) : '') + ' · connects ' + gw.connects + (gw.intentNote ? ' · ⚠ ' + gw.intentNote : ''),
           lastPollAt: lastPollAt ? new Date(lastPollAt).toISOString() : '',
           lastError,
           seen: seen.size,
@@ -462,7 +702,21 @@ export function apply(ctx) {
   }
 
   loadState()
+  fileLog('info', 'node ' + process.versions.node + ' · WebSocket=' + (typeof WebSocket) + ' · transport=gateway-first')
+  void connectGateway()
   void loop()
+
+  // 独立定时器：连接健康时 connectGateway 不会被再调，意图升回必须自己起个闹钟
+  setInterval(() => {
+    if (disposed) return
+    if (gwIntents === FULL_INTENTS) return
+    if (!gw.downgradedAt || Date.now() - gw.downgradedAt < 300000) return
+    log('intent upgrade attempt (60s tick)')
+    gwIntents = FULL_INTENTS
+    gw.downgradedAt = 0
+    gw.attempts = 0
+    gwRestart(true)
+  }, 60000)
   log('watching discord channel, poll', CFG.pollMs, 'ms')
 
   ctx.effect(() => () => {
