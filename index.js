@@ -128,7 +128,7 @@ function flatten(message) {
 
 // 把一批消息压成一段最短的提示：一行头 + 正文 + 一行回法。
 // 多条挤在同一轮里投，别让每条消息各叫醒一次。
-function composeInbound(items, kindLabel) {
+function composeInbound(items, kindLabel, hint) {
   const rows = []
   for (const it of items) {
     const text = (it.text || '').trim()
@@ -145,7 +145,8 @@ function composeInbound(items, kindLabel) {
   const body = rows.length === 1
     ? rows[0].text
     : rows.map((r) => '- ' + (r.at ? r.at + ' ' : '') + r.text).join('\n')
-  return head + '\n' + body + '\n↩ discord_reply，短句纯文本'
+  const tail = hint === undefined ? '↩ discord_reply，短句纯文本' : hint
+  return tail ? head + '\n' + body + '\n' + tail : head + '\n' + body
 }
 
 function hhmm(iso) {
@@ -242,7 +243,7 @@ async function drainInbox(cfg) {
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
   writeFileSync(file, '', 'utf8')
   // 兜底也合并成一轮，别一行叫醒一次
-  const body = composeInbound(lines.map((l) => ({ name: '本机兜底', at: '', text: l })), '兜底')
+  const body = composeInbound(lines.map((l) => ({ name: '本机兜底', at: '', text: l })), '兜底', '')
   if (!body) return
   try {
     await deliver(body)
