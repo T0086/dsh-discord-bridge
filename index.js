@@ -10,7 +10,10 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
-import { request as httpsRequest } from 'node:https'
+import { request as httpsRequest, Agent } from 'node:https'
+
+// 复用连接：不开 keep-alive 的话每 10 秒都要重做一次 TLS 握手
+const keepAlive = new Agent({ keepAlive: true, maxSockets: 2 })
 
 export const name = 'discord-bridge'
 export const inject = ['sessionController', 'tools']
@@ -92,7 +95,7 @@ function api(method, path, token, body) {
       headers['Content-Type'] = 'application/json'
       headers['Content-Length'] = payload.length
     }
-    const req = httpsRequest({ host: CFG.host, path: '/api/v10' + path, method, headers, timeout: 15000 }, (res) => {
+    const req = httpsRequest({ host: CFG.host, path: '/api/v10' + path, method, headers, timeout: 15000, agent: keepAlive }, (res) => {
       const chunks = []
       res.on('data', (c) => chunks.push(c))
       res.on('end', () => {
