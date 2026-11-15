@@ -25,7 +25,18 @@ const CFG = {
 }
 
 const log = (...a) => console.log('[discord-bridge]', ...a)
-const warn = (...a) => console.warn('[discord-bridge]', ...a)
+const warn = (...a) => { console.warn('[discord-bridge]', ...a); fileLog('warn', a.join(' ')) }
+
+// 宿主进程的 console 我看不到，出错必须落盘，否则桥死掉是无声的
+const LOGFILE = 'D:\\DeepSeek\\workspace\\tmp\\discord-bridge.log'
+function fileLog(kind, msg) {
+  try {
+    mkdirSync(dirname(LOGFILE), { recursive: true })
+    const stat = (() => { try { return readFileSync(LOGFILE, 'utf8').length } catch { return 0 } })()
+    if (stat > 400000) writeFileSync(LOGFILE, '', 'utf8')
+    writeFileSync(LOGFILE, new Date().toISOString() + ' [' + kind + '] ' + String(msg).slice(0, 2000) + '\n', { flag: 'a' })
+  } catch {}
+}
 
 let ctxRef = null
 let disposed = false
@@ -115,17 +126,41 @@ function flatten(message) {
   return parts.join('\n')
 }
 
-async function deliver(message, authorName, text) {
+// 把一批消息压成一段最短的提示：一行头 + 正文 + 一行回法。
+// 多条挤在同一轮里投，别让每条消息各叫醒一次。
+function composeInbound(items, kindLabel) {
+  const rows = []
+  for (const it of items) {
+    const text = (it.text || '').trim()
+    if (!text) continue
+    rows.push({ at: it.at || '', name: it.name || 'someone', text })
+  }
+  if (rows.length === 0) return ''
+  const who = rows[0].name
+  const span = rows.length === 1
+    ? rows[0].at
+    : (rows[0].at || '') + '~' + (rows[rows.length - 1].at || '')
+  const head = '[discord/' + kindLabel + '] ' + who + (span ? ' ' + span : '') +
+    (rows.length > 1 ? '（' + rows.length + ' 条）' : '')
+  const body = rows.length === 1
+    ? rows[0].text
+    : rows.map((r) => '- ' + (r.at ? r.at + ' ' : '') + r.text).join('\n')
+  return head + '\n' + body + '\n↩ discord_reply，短句纯文本'
+}
+
+function hhmm(iso) {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return ''
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0')
+}
+
+async function deliver(text) {
   const ac = new AbortController()
   await ctxRef.sessionController.prompt({
-    requestId: 'discord-' + message.id,
+    requestId: 'discord-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
     sessionId: CFG.targetSessionId,
     mode: 'queue',
-    content: [{
-      type: 'text',
-      text: '【来自 Discord · ' + authorName + '】' + text
-        + '\n\n（回他用 discord_reply，纯文本，别带 Markdown）',
-    }],
+    content: [{ type: 'text', text }],
   }, ac.signal)
 }
 
@@ -206,22 +241,15 @@ async function drainInbox(cfg) {
   if (!text.trim()) return
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
   writeFileSync(file, '', 'utf8')
-  for (const line of lines) {
-    try {
-      await ctxRef.sessionController.prompt({
-        requestId: 'inbox-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7),
-        sessionId: CFG.targetSessionId,
-        mode: 'queue',
-        content: [{
-          type: 'text',
-          text: '【来自 Discord · 本机兜底】' + line + '\n\n（回他用 discord_reply，纯文本，别带 Markdown）',
-        }],
-      }, new AbortController().signal)
-      log('inbox delivered:', line.slice(0, 40))
-    } catch (err) {
-      lastError = String(err?.message || err)
-      warn('inbox deliver failed:', lastError)
-    }
+  // 兜底也合并成一轮，别一行叫醒一次
+  const body = composeInbound(lines.map((l) => ({ name: '本机兜底', at: '', text: l })), '兜底')
+  if (!body) return
+  try {
+    await deliver(body)
+    log('inbox delivered:', lines.length, 'line(s)')
+  } catch (err) {
+    lastError = String(err?.message || err)
+    warn('inbox deliver failed:', lastError)
   }
 }
 
@@ -230,7 +258,7 @@ async function poll() {
   lastPollAt = Date.now()
   let cfg = loadCfg()
   if (!cfg) return
-  await drainInbox(cfg)
+  try { await drainInbox(cfg) } catch (err) { warn('drainInbox error:', String(err?.message || err)) }
   if (!cfg.token) return
   // 只给了 token 就自己找频道，找到后写回配置
   if (!cfg.channelId && cfg.autoDiscover !== false) {
@@ -291,27 +319,31 @@ async function poll() {
       }
     }
     for (const m of fresh) {
-      const text = flatten(m)
-      if (!text) { seen.add(m.id); continue }
-      if ((attempts.get(m.id) || 0) >= 5) {
-        warn('giving up on', m.id)
-        seen.add(m.id)
-        continue
-      }
-      const authorName = (m.author && (m.author.global_name || m.author.username)) || 'someone'
+      if (!flatten(m)) seen.add(m.id)
+    }
+    const pending = fresh.filter((m) => flatten(m) && (attempts.get(m.id) || 0) < 5)
+    if (pending.length) {
+      const body = composeInbound(pending.map((m) => ({
+        at: hhmm(m.timestamp),
+        name: (m.author && (m.author.global_name || m.author.username)) || 'someone',
+        text: flatten(m),
+      })), target.kind === 'dm' ? '私信' : '频道')
       try {
-        await deliver(m, authorName, text)
-        seen.add(m.id)
-        attempts.delete(m.id)
+        await deliver(body)
+        for (const m of pending) {
+          seen.add(m.id)
+          attempts.delete(m.id)
+        }
         lastError = ''
-        log('inbound:', text.slice(0, 40))
+        log('inbound:', pending.length, 'msg ->', body.slice(0, 60))
       } catch (err) {
-        attempts.set(m.id, (attempts.get(m.id) || 0) + 1)
+        for (const m of pending) attempts.set(m.id, (attempts.get(m.id) || 0) + 1)
         lastError = String(err?.message || err)
         warn('deliver failed:', lastError)
       }
     }
-    if (newest) lastId = newest
+    // 投失败的这批不推进游标，下一轮还会被 after=lastId 捞出来重试
+    if (newest && !(pending.length && lastError)) lastId = newest
     saveState()
   } catch (err) {
     lastError = String(err?.message || err)
@@ -322,7 +354,12 @@ async function poll() {
 async function loop() {
   // 配置还没写、或者刚改过，都靠每轮重读来感知
   while (!disposed) {
-    await poll()
+    try {
+      await poll()
+    } catch (err) {
+      // 一轮坏掉不能让整条桥永久停止：记下来，下一轮照跑
+      warn('loop error:', String(err?.message || err), String(err?.stack || ''))
+    }
     await new Promise((r) => setTimeout(r, CFG.pollMs))
   }
 }
