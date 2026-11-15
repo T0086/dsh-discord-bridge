@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Discord bridge",
+    "description": "Forwards new Discord channel messages into this same session and posts the replies back."
+  }
+}
