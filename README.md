@@ -1,3 +1,5 @@
+> **已并入 [dsh-bridges](https://github.com/T0086/dsh-bridges)** —— 这个仓库归档保留，后续开发在 dsh-bridges/discord-bridge/。
+
 # dsh-discord-bridge
 
 一个 DSH 插件：把 Discord 私信/频道的消息投进**指定的那个会话**，再把回答发回 Discord。
