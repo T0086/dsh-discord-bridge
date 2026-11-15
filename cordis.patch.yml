@@ -1,0 +1,3 @@
+- insert:
+    - id: discord-bridge
+      name: '@local/discord-bridge'
