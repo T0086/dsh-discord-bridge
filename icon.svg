@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Discord bridge">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4C6B8A"/>
+      <stop offset="1" stop-color="#2B3D52"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="15" fill="url(#bg)"/>
+  <path d="M12 42h40" fill="none" stroke="#E8EEF5" stroke-width="4" stroke-linecap="round"/>
+  <path d="M16 42c0-9 7.2-16 16-16s16 7 16 16" fill="none" stroke="#E8EEF5" stroke-width="4" stroke-linecap="round"/>
+  <path d="M24 42v-6M32 42v-9M40 42v-6" fill="none" stroke="#8FB4D9" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="32" cy="22" r="3.2" fill="#8FB4D9"/>
+</svg>
