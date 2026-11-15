@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Discord 桥",
+    "description": "把 Discord 频道里的新消息投进同一个会话，再把回答发回 Discord。"
+  }
+}
